@@ -1,0 +1,6 @@
+[Unit]
+Description=svc: reap ad-hoc processes whose owner exited
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/svc gc

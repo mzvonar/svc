@@ -1,0 +1,6 @@
+[Unit]
+Description=svc: web UI (socket-activated, exits when idle)
+Requires=svc-web.socket
+
+[Service]
+ExecStart=/usr/bin/env python3 %h/.local/lib/svc/svc-web.py

@@ -1,0 +1,9 @@
+[Unit]
+Description=svc: web UI socket (activates svc-web.service on first connection)
+
+[Socket]
+ListenStream=127.0.0.1:9099
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target

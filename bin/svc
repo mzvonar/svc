@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""svc — worktree-aware dev-service manager on top of the systemd user instance.
+
+The systemd --user manager is the machine-global daemon: it owns every
+long-running dev process, survives any client session, and kills whole
+cgroups so nothing dangles. svc is only the convention layer:
+
+  - service definitions live in services.toml at each repo root
+  - instances are keyed per worktree (same repo, N worktrees -> N units,
+    N deterministic ports)
+  - ad-hoc processes are tagged with the PID that started them and reaped
+    by `svc gc` (run from a systemd timer) once that owner is gone
+
+Linux only. State: ~/.local/state/svc/ports.json
+"""
+
+import hashlib
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("SVC_STATE_DIR") or Path.home() / ".local/state/svc")
+PORTS_FILE = STATE_DIR / "ports.json"
+UNIT_RE = re.compile(r"^svc-(?P<adhoc>adhoc-)?(?P<service>.+)@(?P<slug>[^@]+)\.service$")
+
+
+def die(msg, code=1):
+    print(f"svc: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def sh(args, **kw):
+    return subprocess.run(args, text=True, capture_output=True, **kw)
+
+
+def systemctl(*args):
+    return sh(["systemctl", "--user", "--no-pager", *args])
+
+
+def sanitize(s):
+    return re.sub(r"[^A-Za-z0-9_.-]", "-", s).strip("-").lower()
+
+
+# ---------------------------------------------------------------- config
+
+def parse_toml_min(text):
+    """Fallback parser for the services.toml subset (tables, str/int/bool)."""
+    data, cur = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = re.match(r"\[([^\]]+)\]$", line)
+        if m:
+            cur = data.setdefault(m.group(1).strip('"'), {})
+            continue
+        m = re.match(r"([A-Za-z0-9_-]+)\s*=\s*(.+?)\s*(#.*)?$", line)
+        if m and cur is not None:
+            k, v = m.group(1), m.group(2).strip()
+            if v.startswith('"') and v.endswith('"'):
+                cur[k] = v[1:-1]
+            elif v in ("true", "false"):
+                cur[k] = v == "true"
+            elif re.fullmatch(r"-?\d+", v):
+                cur[k] = int(v)
+            else:
+                cur[k] = v
+    return data
+
+
+def load_toml(path):
+    text = path.read_text()
+    try:
+        import tomllib
+        return tomllib.loads(text)
+    except ModuleNotFoundError:
+        return parse_toml_min(text)
+
+
+class Ctx:
+    """Identity of the current worktree + its service definitions."""
+
+    def __init__(self):
+        r = sh(["git", "rev-parse", "--show-toplevel"])
+        if r.returncode != 0:
+            die("not inside a git repository (ad-hoc processes work anywhere: svc run -- <cmd>)")
+        self.top = Path(r.stdout.strip())
+        common = sh(["git", "rev-parse", "--git-common-dir"]).stdout.strip()
+        common_p = Path(common) if os.path.isabs(common) else (Path.cwd() / common).resolve()
+        main_root = common_p.parent if common_p.name == ".git" else common_p
+        self.repo = sanitize(main_root.name)
+        h = hashlib.sha1(str(self.top).encode()).hexdigest()[:4]
+        if self.top.resolve() == main_root.resolve():
+            self.slug = f"{self.repo}-{h}"
+        else:
+            self.slug = sanitize(f"{self.repo}-{self.top.name}-{h}")
+        cfg = self.top / "services.toml"
+        self.defs = load_toml(cfg) if cfg.exists() else {}
+
+    def service(self, name):
+        if name not in self.defs:
+            have = ", ".join(self.defs) or "none — no services.toml at repo root"
+            die(f"no service '{name}' defined (have: {have})")
+        return self.defs[name]
+
+
+def adhoc_slug():
+    """Slug for ad-hoc processes started outside any git repo."""
+    try:
+        return Ctx().slug
+    except SystemExit:
+        return "nogit-" + hashlib.sha1(str(Path.cwd()).encode()).hexdigest()[:4]
+
+
+# ---------------------------------------------------------------- ports
+
+def load_ports():
+    try:
+        return json.loads(PORTS_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_ports(d):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = PORTS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
+    tmp.replace(PORTS_FILE)
+
+
+def alloc_port(ctx, name, base, slug):
+    key = f"{ctx.repo}/{name}"
+    d = load_ports()
+    ent = d.setdefault(key, {})
+    if slug in ent:
+        ent[slug]["wt"] = str(ctx.top)
+        save_ports(d)
+        return ent[slug]["port"]
+    used = {e["port"] for svcs in d.values() for e in svcs.values()}
+    port = base
+    while port in used:
+        port += 1
+    ent[slug] = {"port": port, "wt": str(ctx.top)}
+    save_ports(d)
+    return port
+
+
+# ---------------------------------------------------------------- /proc
+
+def proc_stat(pid):
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    rest = data.rsplit(")", 1)[1].split()
+    return {"ppid": int(rest[1]), "starttime": rest[19]}
+
+
+def proc_cmdline(pid):
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+    except OSError:
+        return ""
+
+
+def find_owner():
+    """Walk our ancestry; prefer the nearest claude process, else our parent shell."""
+    fallback = os.getppid()
+    cur = fallback
+    for _ in range(64):
+        if cur <= 1:
+            break
+        if "claude" in proc_cmdline(cur):
+            fallback = cur
+            break
+        st = proc_stat(cur)
+        if not st:
+            break
+        cur = st["ppid"]
+    st = proc_stat(fallback)
+    return fallback, (st["starttime"] if st else "?")
+
+
+def owner_alive(pid, starttime):
+    st = proc_stat(pid)
+    if not st:
+        return False
+    return starttime in ("?", st["starttime"])
+
+
+# ---------------------------------------------------------------- units
+
+def list_units(pattern="svc-*@*.service"):
+    r = systemctl("list-units", pattern, "--all", "--output=json")
+    if r.returncode != 0:
+        die(f"systemctl failed (needs a systemd user instance; Linux only): {r.stderr.strip()}")
+    try:
+        return json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        die("systemctl --output=json unsupported (systemd >= 246 required)")
+
+
+def unit_props(unit, *props):
+    r = systemctl("show", unit, *[f"-p{p}" for p in props])
+    out = {}
+    for line in r.stdout.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+def unit_env(unit):
+    env = {}
+    raw = unit_props(unit, "Environment").get("Environment", "")
+    for tok in shlex.split(raw):
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            env[k] = v
+    return env
+
+
+def is_active(unit):
+    return systemctl("is-active", "--quiet", unit).returncode == 0
+
+
+def unit_for(ctx, name):
+    d = ctx.defs.get(name, {})
+    slug = "global" if d.get("singleton") else ctx.slug
+    return f"svc-{name}@{slug}.service"
+
+
+def resolve_unit(arg, ctx=None):
+    """Accept a bare service name (resolved in current worktree) or a full unit name."""
+    if "@" in arg:
+        return arg if arg.endswith(".service") else arg + ".service"
+    ctx = ctx or Ctx()
+    if arg in ctx.defs:
+        return unit_for(ctx, arg)
+    for prefix in ("svc-", "svc-adhoc-"):
+        cand = f"{prefix}{arg}@{ctx.slug}.service"
+        if is_active(cand) or any(u["unit"] == cand for u in list_units()):
+            return cand
+    return unit_for(ctx, arg)  # triggers the "no service" error path via caller
+
+
+# ---------------------------------------------------------------- compose passthrough
+
+def compose_cmd(ctx, d):
+    f = ctx.top / d["compose"]
+    if not f.exists():
+        die(f"compose file not found: {f}")
+    return ["docker", "compose", "-f", str(f)]
+
+
+def compose_action(ctx, d, action):
+    base = compose_cmd(ctx, d)
+    args = {"up": ["up", "-d"], "stop": ["stop"], "restart": ["restart"], "status": ["ps"]}[action]
+    subprocess.run(base + args)
+
+
+# ---------------------------------------------------------------- commands
+
+def start_service(ctx, name):
+    d = ctx.service(name)
+    if "compose" in d:
+        compose_action(ctx, d, "up")
+        return
+    if "cmd" not in d:
+        die(f"service '{name}' has neither cmd nor compose")
+    unit = unit_for(ctx, name)
+    if is_active(unit):
+        print(f"{name}: already running ({unit})")
+        return
+    systemctl("reset-failed", unit)
+    slug = "global" if d.get("singleton") else ctx.slug
+    env = {
+        "SVC_KIND": "service",
+        "SVC_SERVICE": name,
+        "SVC_SLUG": slug,
+        "SVC_REPO": ctx.repo,
+        "SVC_WORKTREE": str(ctx.top),
+    }
+    if "port_base" in d:
+        port = alloc_port(ctx, name, int(d["port_base"]), slug)
+        env["PORT"] = env["SVC_PORT"] = str(port)
+    args = [
+        "systemd-run", "--user", "--unit", unit,
+        "--description", f"svc {name} @ {ctx.top}",
+        "--working-directory", str(ctx.top),
+        "--property=Restart=on-failure", "--property=RestartSec=2",
+    ]
+    for k, v in env.items():
+        args += ["--setenv", f"{k}={v}"]
+    args += ["--", "/bin/bash", "-lc", d["cmd"]]
+    r = sh(args)
+    if r.returncode != 0:
+        die(f"systemd-run failed: {r.stderr.strip()}")
+    msg = f"{name}: started ({unit}"
+    msg += f", PORT={env['SVC_PORT']})" if "SVC_PORT" in env else ")"
+    print(msg)
+
+
+def cmd_up(argv):
+    ctx = Ctx()
+    names = argv or list(ctx.defs)
+    if not names:
+        die("no services.toml at repo root and no service named")
+    for name in names:
+        start_service(ctx, name)
+
+
+def cmd_stop(argv):
+    if not argv:
+        die("usage: svc stop <service|unit> | svc down")
+    for arg in argv:
+        ctx = None if "@" in arg else Ctx()
+        if ctx and arg in ctx.defs and "compose" in ctx.defs[arg]:
+            compose_action(ctx, ctx.defs[arg], "stop")
+            continue
+        unit = resolve_unit(arg, ctx)
+        systemctl("stop", unit)
+        systemctl("reset-failed", unit)
+        print(f"stopped {unit}")
+
+
+def cmd_down(_argv):
+    ctx = Ctx()
+    n = 0
+    for u in list_units():
+        m = UNIT_RE.match(u["unit"])
+        if m and m.group("slug") == ctx.slug and u["active"] != "inactive":
+            systemctl("stop", u["unit"])
+            systemctl("reset-failed", u["unit"])
+            print(f"stopped {u['unit']}")
+            n += 1
+    for name, d in ctx.defs.items():
+        if "compose" in d:
+            compose_action(ctx, d, "stop")
+            n += 1
+    if n == 0:
+        print("nothing running for this worktree")
+
+
+def cmd_restart(argv):
+    if not argv:
+        die("usage: svc restart <service>")
+    ctx = Ctx()
+    for name in argv:
+        d = ctx.service(name)
+        if "compose" in d:
+            compose_action(ctx, d, "restart")
+            continue
+        unit = unit_for(ctx, name)
+        systemctl("stop", unit)
+        systemctl("reset-failed", unit)
+        start_service(ctx, name)
+
+
+def cmd_logs(argv):
+    follow = "-f" in argv
+    argv = [a for a in argv if a != "-f"]
+    n = "200"
+    if "-n" in argv:
+        i = argv.index("-n")
+        n = argv[i + 1]
+        del argv[i:i + 2]
+    if not argv:
+        die("usage: svc logs <service|unit> [-f] [-n N]")
+    unit = resolve_unit(argv[0])
+    cmd = ["journalctl", "--user", "-u", unit, "-n", n, "--no-pager"]
+    if follow:
+        cmd.append("-f")
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
+def cmd_run(argv):
+    name = None
+    if argv and argv[0] == "--name":
+        name = sanitize(argv[1])
+        argv = argv[2:]
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        die("usage: svc run [--name <n>] -- <command> [args...]")
+    slug = adhoc_slug()
+    name = name or sanitize(os.path.basename(argv[0]))
+    unit = f"svc-adhoc-{name}@{slug}.service"
+    if is_active(unit):
+        die(f"{unit} already running — svc stop {unit} first, or pass --name")
+    systemctl("reset-failed", unit)
+    opid, ostart = find_owner()
+    args = [
+        "systemd-run", "--user", "--unit", unit,
+        "--description", f"svc ad-hoc: {' '.join(argv)[:60]}",
+        "--working-directory", str(Path.cwd()),
+        "--setenv", "SVC_KIND=adhoc",
+        "--setenv", f"SVC_SERVICE={name}",
+        "--setenv", f"SVC_SLUG={slug}",
+        "--setenv", f"SVC_WORKTREE={Path.cwd()}",
+        "--setenv", f"SVC_OWNER_PID={opid}",
+        "--setenv", f"SVC_OWNER_START={ostart}",
+        "--", "/bin/bash", "-lc", shlex.join(argv),
+    ]
+    r = sh(args)
+    if r.returncode != 0:
+        die(f"systemd-run failed: {r.stderr.strip()}")
+    print(f"started {unit} (owner pid {opid}; reaped by gc when owner exits)")
+
+
+def collect_rows():
+    rows = []
+    seen = set()
+    for u in list_units():
+        m = UNIT_RE.match(u["unit"])
+        if not m:
+            continue
+        env = unit_env(u["unit"])
+        props = unit_props(u["unit"], "MainPID", "ActiveEnterTimestamp")
+        opid = env.get("SVC_OWNER_PID")
+        row = {
+            "unit": u["unit"],
+            "service": env.get("SVC_SERVICE") or m.group("service"),
+            "slug": env.get("SVC_SLUG") or m.group("slug"),
+            "kind": env.get("SVC_KIND", "adhoc" if m.group("adhoc") else "service"),
+            "state": f"{u['active']}/{u['sub']}",
+            "port": env.get("SVC_PORT", ""),
+            "pid": props.get("MainPID", ""),
+            "wt": env.get("SVC_WORKTREE", ""),
+            "since": props.get("ActiveEnterTimestamp", ""),
+            "owner": opid or "",
+            "owner_alive": bool(opid) and owner_alive(int(opid), env.get("SVC_OWNER_START", "?")),
+        }
+        rows.append(row)
+        seen.add((row["slug"], row["service"]))
+    for key, ent in load_ports().items():
+        service = key.split("/", 1)[1]
+        for slug, info in ent.items():
+            if (slug, service) not in seen:
+                rows.append({
+                    "unit": f"svc-{service}@{slug}.service",
+                    "service": service, "slug": slug, "kind": "service",
+                    "state": "stopped", "port": str(info["port"]), "pid": "",
+                    "wt": info.get("wt", ""), "since": "", "owner": "", "owner_alive": False,
+                })
+    return sorted(rows, key=lambda r: (r["slug"], r["service"]))
+
+
+def cmd_status(argv):
+    rows = collect_rows()
+    if "--json" in argv:
+        print(json.dumps(rows, indent=1))
+        return
+    if not rows:
+        print("no managed processes (and no known stopped services)")
+        return
+    cols = ["SERVICE", "INSTANCE", "KIND", "STATE", "PORT", "PID", "OWNER"]
+    table = []
+    for r in rows:
+        owner = r["owner"] and (r["owner"] + ("" if r["owner_alive"] else " (dead)")) or "-"
+        table.append([r["service"], r["slug"], r["kind"], r["state"], r["port"] or "-", r["pid"] or "-", owner])
+    widths = [max(len(c), *(len(row[i]) for row in table)) for i, c in enumerate(cols)]
+    print("  ".join(c.ljust(widths[i]) for i, c in enumerate(cols)))
+    for row in table:
+        print("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)))
+    try:
+        ctx = Ctx()
+        for name, d in ctx.defs.items():
+            if "compose" in d:
+                print(f"\ncompose [{name}] ({d['compose']}):")
+                compose_action(ctx, d, "status")
+    except SystemExit:
+        pass
+
+
+def cmd_gc(argv):
+    dry = "--dry-run" in argv
+    reaped = []
+    for u in list_units():
+        m = UNIT_RE.match(u["unit"])
+        if not m:
+            continue
+        env = unit_env(u["unit"])
+        reason = None
+        if env.get("SVC_KIND") == "adhoc":
+            opid = env.get("SVC_OWNER_PID")
+            if u["active"] == "failed":
+                reason = "failed"
+            elif opid and not owner_alive(int(opid), env.get("SVC_OWNER_START", "?")):
+                reason = f"owner {opid} gone"
+        wt = env.get("SVC_WORKTREE")
+        if not reason and wt and not Path(wt).is_dir():
+            reason = f"worktree removed ({wt})"
+        if reason:
+            reaped.append((u["unit"], reason))
+            if not dry:
+                systemctl("stop", u["unit"])
+                systemctl("reset-failed", u["unit"])
+    verb = "would reap" if dry else "reaped"
+    if reaped:
+        for unit, reason in reaped:
+            print(f"{verb} {unit}: {reason}")
+    else:
+        print("nothing to reap")
+
+
+def cmd_ports(_argv):
+    d = load_ports()
+    if not d:
+        print("no ports allocated")
+        return
+    for key in sorted(d):
+        for slug, info in sorted(d[key].items()):
+            print(f"{info['port']}  {key}  {slug}  {info.get('wt', '')}")
+
+
+def cmd_config(_argv):
+    ctx = Ctx()
+    print(f"repo:     {ctx.repo}")
+    print(f"worktree: {ctx.top}")
+    print(f"slug:     {ctx.slug}")
+    if not ctx.defs:
+        print("services: none (no services.toml at repo root)")
+        return
+    ports = load_ports()
+    print("services:")
+    for name, d in ctx.defs.items():
+        slug = "global" if d.get("singleton") else ctx.slug
+        alloc = ports.get(f"{ctx.repo}/{name}", {}).get(slug, {}).get("port")
+        if "compose" in d:
+            print(f"  {name}: compose {d['compose']}")
+        else:
+            port = f" port_base={d['port_base']} allocated={alloc or '-'}" if "port_base" in d else ""
+            print(f"  {name}: {d.get('cmd', '?')}{port} -> {unit_for(ctx, name)}")
+
+
+def cmd_web(_argv):
+    print("web UI: http://127.0.0.1:9099  (socket-activated)")
+    print("remote: ssh -L 9099:127.0.0.1:9099 <host>")
+
+
+HELP = """svc — shared dev-process manager (systemd user instance underneath)
+
+usage:
+  svc status [--json]        all managed processes, all worktrees (+ known stopped)
+  svc up [name...]           start service(s) from ./services.toml (idempotent)
+  svc stop <name|unit>...    stop a service (bare name = this worktree)
+  svc restart <name>...      stop + start from current definition
+  svc down                   stop everything belonging to this worktree
+  svc logs <name> [-f] [-n N]
+  svc run [--name n] -- cmd  tracked ad-hoc process; reaped when starter exits
+  svc gc [--dry-run]         reap ad-hoc units with dead owners / removed worktrees
+  svc ports                  port allocations
+  svc config                 parsed services.toml + slug for this worktree
+  svc web                    web UI URL
+
+services.toml (repo root):
+  [dev-server]
+  cmd = "npm run dev"        # runs with PORT set from port_base + worktree offset
+  port_base = 3000
+  [db]
+  compose = "docker/docker-compose.yml"   # passthrough to docker compose
+  [tunnel]
+  cmd = "cloudflared tunnel run dev"
+  singleton = true           # one per machine, not per worktree
+"""
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(HELP)
+        return
+    cmds = {
+        "status": cmd_status, "ls": cmd_status, "up": cmd_up, "start": cmd_up,
+        "stop": cmd_stop, "down": cmd_down, "restart": cmd_restart,
+        "logs": cmd_logs, "run": cmd_run, "gc": cmd_gc, "ports": cmd_ports,
+        "config": cmd_config, "web": cmd_web,
+    }
+    fn = cmds.get(argv[0])
+    if not fn:
+        die(f"unknown command '{argv[0]}' (svc --help)")
+    fn(argv[1:])
+
+
+if __name__ == "__main__":
+    main()

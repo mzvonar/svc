@@ -1,0 +1,10 @@
+{
+  "name": "svc",
+  "description": "Manage long-running dev processes (dev servers, databases, tunnels, watchers) through the machine-global svc manager; each git worktree gets its own instance and port.",
+  "version": "1.0.0",
+  "author": { "name": "Martin Zvonár", "url": "https://github.com/mzvonar" },
+  "homepage": "https://github.com/mzvonar/svc",
+  "repository": "https://github.com/mzvonar/svc",
+  "license": "MIT",
+  "keywords": ["dev-server", "process-manager", "worktree", "systemd"]
+}

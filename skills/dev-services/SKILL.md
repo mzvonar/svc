@@ -85,3 +85,6 @@ for short commands (builds, tests); run those normally.
   `lsof -i :<port>`, report to user instead of killing blindly.
 - Stale allocations / removed worktrees are cleaned by `svc gc`
   (runs every minute from a timer; manual run is safe).
+
+---
+To change this skill, do not edit the plugin cache copy: change it in this repository, push, then bump its entry in `mzvonar/claude-skills-public`. See `/dev-tools:update-skill`.

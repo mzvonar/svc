@@ -62,12 +62,14 @@ singleton = true           # one per machine
 
 ## Claude Code integration
 
-`skill/` contains a `dev-services` skill teaching sessions to check
+`skills/dev-services/` contains a `dev-services` skill teaching sessions to check
 `svc status` first and never start long-running processes directly.
 Symlink it into your profile:
 
 ```bash
-ln -s ~/Development/svc/skill ~/.claude/skills/dev-services
+# as a plugin (recommended): /plugin marketplace add mzvonar/claude-skills-public → /plugin install svc@claude-skills-public
+# or from a checkout:        claude --plugin-dir <checkout>
+# legacy symlink:            ln -s <checkout>/skills/dev-services ~/.claude/skills/dev-services
 ```
 
 ## Layout
@@ -76,7 +78,7 @@ ln -s ~/Development/svc/skill ~/.claude/skills/dev-services
 bin/svc            CLI (python3, stdlib only)
 web/svc-web.py     web UI (stdlib only, socket-activated)
 units/             svc-gc.{service,timer}, svc-web.{socket,service}
-skill/SKILL.md     Claude Code skill
+skills/dev-services/SKILL.md   Claude Code skill (plugin: .claude-plugin/plugin.json)
 install.sh
 ```
 

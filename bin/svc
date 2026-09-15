@@ -37,7 +37,31 @@ def sh(args, **kw):
     return subprocess.run(args, text=True, capture_output=True, **kw)
 
 
+def ensure_user_bus():
+    """Point systemctl --user at the user bus when the caller's env forgot to.
+
+    `systemctl --user` locates the manager through XDG_RUNTIME_DIR. A shell that never
+    exported it fails with "Failed to connect to bus: No medium found" -- indistinguishable
+    from "there is no user manager", which sent more than one debugging session after
+    systemd itself while the manager was running the whole time.
+
+    It is missing more often than it looks: the usual export sits in ~/.bashrc BELOW the
+    `[ -z "$PS1" ] && return` guard, so every NON-interactive shell -- an agent's tool call,
+    `ssh host svc status`, cron, a script -- returns before reaching it. svc then appears
+    broken to automation and fine to a human in a terminal.
+
+    Only fills in the default socket path when it actually exists; a real absence still
+    reports as before, and an env that already set the variable is never second-guessed.
+    """
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        return
+    candidate = f"/run/user/{os.getuid()}"
+    if os.path.isdir(candidate):
+        os.environ["XDG_RUNTIME_DIR"] = candidate
+
+
 def systemctl(*args):
+    ensure_user_bus()
     return sh(["systemctl", "--user", "--no-pager", *args])
 
 
@@ -167,6 +191,21 @@ def proc_cmdline(pid):
         return ""
 
 
+def is_claude_proc(pid):
+    """True when pid IS a claude process -- by executable name, never by substring.
+
+    `"claude" in proc_cmdline(pid)` looked equivalent and is not: an agent's tool-call shell
+    runs `bash -c 'source /root/.claude/shell-snapshots/...'`, whose cmdline contains "claude"
+    inside a PATH. The walk then stopped on its own EPHEMERAL parent shell and recorded that
+    as the owner -- a pid already gone by the time the unit finished starting, so every
+    service an agent started was born orphaned and `svc gc` was entitled to reap it. Matching
+    the executable name walks past the shell to the real claude process, which lives as long
+    as the session does.
+    """
+    argv0 = proc_cmdline(pid).split(" ", 1)[0]
+    return os.path.basename(argv0.rstrip(":")) == "claude"
+
+
 def find_owner():
     """Walk our ancestry; prefer the nearest claude process, else our parent shell."""
     fallback = os.getppid()
@@ -174,7 +213,7 @@ def find_owner():
     for _ in range(64):
         if cur <= 1:
             break
-        if "claude" in proc_cmdline(cur):
+        if is_claude_proc(cur):
             fallback = cur
             break
         st = proc_stat(cur)

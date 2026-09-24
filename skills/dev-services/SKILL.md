@@ -7,7 +7,10 @@ description: >-
   DB, or any long-running process; when a port is already in use; when
   checking whether a server is running; or before running anything that
   would outlive this session. Works across git worktrees — each worktree
-  gets its own instance and port.
+  gets its own instance and port. Read it on machines WITHOUT svc too
+  (macOS, CI, a box where install.sh never ran): its first section is the
+  no-svc fallback, which sends you to the repo's own documented procedure
+  and says what to report about a process nothing will be tracking.
 ---
 
 # dev-services (svc)
@@ -17,11 +20,39 @@ never by your session. Processes you start directly die or dangle when the
 session ends; `svc`-managed ones are shared with every other session,
 worktree, and the human user.
 
-**Only on Linux hosts with `svc` installed** (`command -v svc`). If absent
-(e.g. macOS), fall back to docker compose for containers and tell the user
-long-running bare processes can't be shared.
+## First: is svc even here?
 
-## Hard rules
+```bash
+command -v svc
+```
+
+**Nothing? Then this skill does not apply — stop reading at the end of this
+section.** svc is Linux-only (it is a thin layer over the systemd user
+instance) and there is no systemd on macOS, so on a Mac, on a CI runner, or
+on any box where nobody ran `install.sh`, the rules below are not in force
+and following them leaves you unable to start anything at all.
+
+What to do instead, in order:
+
+1. **Follow the repo's own documented procedure** if it has one — a CLAUDE.md
+   / AGENTS.md "running the app" section, a README, a `make dev`. That prose
+   usually carries traps a service definition cannot (rebuild flags, health
+   polls, env switches that decide whether mocks are on). Prefer it over
+   anything you would invent.
+2. **Containers**: `docker compose up` as that procedure says.
+3. **Bare processes** (a dev server, a watcher): start one normally, in the
+   background. This is explicitly ALLOWED here — the ban below is a rule
+   about svc-managed hosts, not a rule about backgrounding.
+4. **Say what you started, because nothing else will.** Without svc there is
+   no registry, so the next session — or you, tomorrow — cannot tell whose
+   process owns a port. Report the URL, the **port**, the **working
+   directory**, and the **commit** it is serving, and say that it will
+   outlive this session and how to stop it (`kill <pid>`).
+
+That last point is the whole cost of not having svc. Pay it explicitly
+rather than leaving a process nobody can identify.
+
+## Hard rules (only where `svc` exists — see above)
 
 - Never run dev servers / DBs / tunnels directly (`npm run dev &`,
   `docker run`, `nohup ...`). Never use your own background-bash for
@@ -85,6 +116,13 @@ for short commands (builds, tests); run those normally.
   `lsof -i :<port>`, report to user instead of killing blindly.
 - Stale allocations / removed worktrees are cleaned by `svc gc`
   (runs every minute from a timer; manual run is safe).
+- `svc: command not found`, or `systemctl failed (needs a systemd user
+  instance; Linux only)` → you are on a host svc does not serve. Do not try
+  to install it to get past this: go to the no-svc fallback at the top.
+  `install.sh` refuses on such a host by design and says so.
+- A repo has `services.toml` but you are on a Mac → the file still tells you
+  the COMMAND for each service; run it by hand. It is a declaration, not a
+  wrapper, so nothing in it needs svc to be readable.
 
 ---
 To change this skill, do not edit the plugin cache copy: change it in this repository, push, then bump its entry in `mzvonar/claude-skills-public`. See `/dev-tools:update-skill`.

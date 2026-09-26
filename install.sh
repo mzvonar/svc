@@ -7,9 +7,21 @@ set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# `systemctl --user` finds the manager through XDG_RUNTIME_DIR, and the usual export sits in
+# ~/.bashrc BELOW the `[ -z "$PS1" ] && return` guard — so every non-interactive shell (an agent's
+# tool call, `ssh host ./install.sh`, cron) arrives without it and the probe below fails with
+# "Failed to connect to bus: No medium found", which reads identically to "there is no user
+# manager". That is the trap `ensure_user_bus` in bin/svc exists for; the installer probed BEFORE
+# filling it in, so it answered "svc is Linux-only" on a Linux box with a running manager. Fill it
+# in on the same terms as bin/svc: only a socket that exists, and never over an env that set it.
+if [ -z "${XDG_RUNTIME_DIR:-}" ] && [ -d "/run/user/$(id -u)" ]; then
+  export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+fi
+
 if ! systemctl --user show-environment >/dev/null 2>&1; then
   echo "error: no systemd user instance reachable — svc is Linux-only." >&2
   echo "       (on macOS keep using docker compose / pm2 directly)" >&2
+  echo "       XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-<unset>}" >&2
   exit 1
 fi
 

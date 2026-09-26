@@ -8,9 +8,10 @@ description: >-
   checking whether a server is running; or before running anything that
   would outlive this session. Works across git worktrees — each worktree
   gets its own instance and port. Read it on machines WITHOUT svc too
-  (macOS, CI, a box where install.sh never ran): its first section is the
-  no-svc fallback, which sends you to the repo's own documented procedure
-  and says what to report about a process nothing will be tracking.
+  (macOS, CI, a box where install.sh never ran): it opens with a freshness
+  check, then the no-svc fallback, which sends you to the repo's own
+  documented procedure and says what to report about a process nothing
+  will be tracking.
 ---
 
 # dev-services (svc)
@@ -20,7 +21,7 @@ never by your session. Processes you start directly die or dangle when the
 session ends; `svc`-managed ones are shared with every other session,
 worktree, and the human user.
 
-## Step 0 — is this session reading the CURRENT skill text?
+## Before you begin — is this session reading the CURRENT skill text?
 
 ```bash
 bash "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-freshness.sh" "${CLAUDE_PLUGIN_ROOT}"
@@ -29,12 +30,17 @@ bash "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-freshness.sh" "${CLAUDE_PLUGIN_ROOT}"
 Local, no network, and **silent** unless something is wrong. Exit **3** — this session is serving
 an older cached copy of THIS plugin than the one installed; a session pins its version at the first
 call and never moves, so a mid-session `claude plugin update` never reaches it. Put it to the user
-(`AskUserQuestion`): reload (`/reload-plugins`) and re-run, or carry on knowingly. Asks once per
-plugin per session. Exit **2** — could not determine, which is not a pass. Exit **4** — this call
-is wired wrong and checked nothing; report it.
+(`AskUserQuestion`): reload (`/reload-plugins`) and re-run, or carry on knowingly — and if you
+already put this question for this plugin in this session, just note it and carry on; the check is
+stateless and will keep reporting. Exit **2** — could not determine, which is not a pass. Exit
+**4**, or `No such file` / exit **127** — this call is wired wrong and checked nothing; report it.
+Why: `docs/conventions.md` in `mzvonar/claude-skills-public`.
 
-Skipped automatically when this skill is not running from a plugin install (a dev symlink or a
-vendored copy), so it costs nothing in those modes.
+**In a dev-symlink or vendored install this line does not run at all** — `${CLAUDE_PLUGIN_ROOT}` is
+substituted only for a plugin install, so the path does not resolve and bash exits 127. That is a
+visible no-op, not a silent skip: this paragraph previously claimed the check "skips automatically,
+so it costs nothing in those modes", which was false. Report the 127 like any other wiring failure;
+svc's own README documents the symlink mode, so it is a shape you will meet.
 
 It runs BEFORE the no-svc check below, not after, and the section below is why: that fallback was
 added to this skill in a later version than some sessions are serving. A stale copy would send a

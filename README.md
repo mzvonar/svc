@@ -79,7 +79,20 @@ bin/svc            CLI (python3, stdlib only)
 web/svc-web.py     web UI (stdlib only, socket-activated)
 units/             svc-gc.{service,timer}, svc-web.{socket,service}
 skills/dev-services/SKILL.md   Claude Code skill (plugin: .claude-plugin/plugin.json)
+scripts/plugin-freshness.sh    the skill's opening staleness check — a COPY of the canonical
+                               one in mzvonar/claude-skills-public (`scripts/`). Change it
+                               THERE first; the self-test compares the two line for line
+                               whenever that checkout sits beside this one.
+scripts/tests/svc.test.py      self-test: the /proc ownership walk, pid reuse, the user-bus
+                               fallback, install.sh's probe order, and the skill's wiring
 install.sh
+```
+
+Run the self-test after touching `bin/svc`, `install.sh` or the skill — it needs nothing
+installed and starts no processes (the process tree it walks is synthetic):
+
+```bash
+python3 scripts/tests/svc.test.py
 ```
 
 State lives in `~/.local/state/svc/ports.json` (port allocations);

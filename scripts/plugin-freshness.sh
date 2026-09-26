@@ -1,10 +1,17 @@
 #!/usr/bin/env bash
 # plugin-freshness.sh — is the skill text THIS SESSION is serving the current one?
 #
-#   plugin-freshness.sh [<skill-or-plugin-dir>] [--quiet] [--json]
+#   plugin-freshness.sh <skill-or-plugin-dir> [--quiet] [--json] [--verbose]
 #
-# Defaults to $CLAUDE_PLUGIN_ROOT, which Claude Code sets to the plugin root of the skill
-# being run — so a skill calls it with no arguments.
+# PASS THE DIRECTORY. `${CLAUDE_PLUGIN_ROOT}` is a token Claude Code substitutes into SKILL.md
+# TEXT when a skill loads; it is NOT an exported environment variable (measured: fifteen CLAUDE_*
+# vars reach a Bash call and that is not one of them). A skill therefore calls:
+#
+#   bash "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-freshness.sh" "${CLAUDE_PLUGIN_ROOT}"
+#
+# The env var is still honoured if it happens to be set, but nothing may rely on it: this usage
+# block used to read "so a skill calls it with no arguments", and thirteen skills wired to that
+# sentence did nothing at all while looking installed.
 #
 # WHY THIS EXISTS, and why check-drift.sh does not cover it.
 #
@@ -53,8 +60,11 @@ while [ $# -gt 0 ]; do
     --quiet)   QUIET=1; shift ;;
     --json)    JSON=1; shift ;;
     --verbose) VERBOSE=1; shift ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    -*) echo "unknown option $1" >&2; exit 2 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    # 4, not 2: a flag this script does not know is the CALLER being wrong, and every skill block
+    # documents 2 as "could not determine — carry on". A typo'd flag used to produce a gate that
+    # never fired and never complained.
+    -*) echo "plugin-freshness: WIRING BUG — unknown option $1" >&2; exit 4 ;;
     *) DIR="$1"; shift ;;
   esac
 done
@@ -79,7 +89,11 @@ if [ -z "$DIR" ]; then
   echo "  Call it as: bash …/scripts/plugin-freshness.sh \"\${CLAUDE_PLUGIN_ROOT}\"" >&2
   exit 4
 fi
-DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "plugin-freshness: no such dir: $DIR" >&2; exit 4; }
+# Keep the ORIGINAL in a second variable: a failed command substitution assigns "" to DIR before
+# the `||` body runs, so the error used to name an empty path.
+DIR_IN="$DIR"
+DIR="$(cd "$DIR" 2>/dev/null && pwd)" || {
+  echo "plugin-freshness: WIRING BUG — no such directory: $DIR_IN" >&2; exit 4; }
 
 # Facts print when there is something to say, or on --verbose. A clean run is SILENT: the old
 # shape printed five fact lines on every success while thirteen skills documented it as "silent
@@ -112,6 +126,20 @@ PLUGIN="${REST%%/*}"    ; REST="${REST#*/}"
 LOADED="${REST%%/*}"
 
 PLUGROOT="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins"
+
+# Name this cause SEPARATELY, because it is the likeliest one on a machine that is not this one.
+# Both readers below go through python3 and swallow their own failure, so without this an agent on
+# a Mac with no Command Line Tools — or a slim container — is told the INSTALL RECORD is absent,
+# unreadable or malformed and sent to inspect a file that is perfectly fine, on every invocation
+# of every wired skill. `dev-services` explicitly targets such hosts.
+if ! command -v python3 >/dev/null 2>&1; then
+  say "  plugin             = $PLUGIN@$MP"
+  say "  loaded             = $LOADED"
+  say ""
+  say "UNKNOWN: python3 is not on PATH, and both version readers need it — freshness UNVERIFIED for $PLUGIN@$MP. This is NOT a pass: the session may be serving stale text and this run cannot tell. The install record itself is fine; do not go looking at it."
+  [ "$JSON" = 1 ] && printf '{"plugin":"%s","marketplace":"%s","loaded":"%s","installed":"","catalog":"","action":"unknown"}\n' "$PLUGIN" "$MP" "$LOADED"
+  exit 2
+fi
 
 # ---- installed: the highest version recorded for this plugin, any scope -----
 # Several records are normal (a plugin installed at project AND local scope, as measured), and
@@ -180,25 +208,27 @@ elif [ -n "${CATALOG:-}" ] && behind "$INSTALLED" "$CATALOG"; then
   MSG="$PLUGIN $INSTALLED is installed while the catalog publishes $CATALOG. PUT IT TO THE USER: update (claude plugin update $PLUGIN@$MP, or scripts/check-drift.sh --update) then reload -- or carry on."
 fi
 
-# ASK ONCE PER SESSION, PER PLUGIN, PER LOADED VERSION. The check is otherwise stateless, so the
-# same question returns on every skill invocation for the rest of the session — measured: a 9.7-day
-# session with six stale plugins owning thirteen step-0 skills would have raised the identical
-# interrupt ~20 times for one decision the user already made. Worse, it is self-triggering:
-# /dev-tools:update-skill ENDS by running `claude plugin update`, which is precisely what makes
-# loaded < installed true, so its own flagship workflow would poison every later skill.
+# THIS SCRIPT IS STATELESS, DELIBERATELY. It reports what it measures, every time, and never
+# remembers that it reported it.
 #
-# The stamp is keyed on the session id, so it cannot leak into the next session; on the plugin, so
-# answering for one says nothing about another; and on the loaded version, so a reload re-arms it.
-# A repeat still reports the skew on --verbose — it is downgraded, not hidden.
-STAMP=""
-if [ "$ACTION" = "ask" ] && [ -n "${CLAUDE_CODE_SESSION_ID:-}" ]; then
-  STAMP="${TMPDIR:-/tmp}/claude-plugin-freshness.${CLAUDE_CODE_SESSION_ID}.${MP}.${PLUGIN}.${LOADED}"
-  if [ -e "$STAMP" ]; then
-    ACTION="asked-already"
-  else
-    : > "$STAMP" 2>/dev/null || true
-  fi
-fi
+# A "once per session" acknowledgement lived here between 2026-09-26 and the same day's review, as
+# a stamp file under TMPDIR keyed on session+plugin+version. It was removed with four independent
+# defects, all of which followed from ONE mistake: a stamp records that A CALL HAPPENED, while the
+# thing worth remembering is THAT THE USER WAS ASKED — and a script cannot observe that.
+#
+#   - The extra `asked-already` action was not `ask`, so refdiff's preflight fell through to
+#     `current (serving <stale>)` — an affirmative claim about a session it had just measured as
+#     stale. Exactly the regression the commit before it existed to remove.
+#   - Only the ask path was stamped, so a PERSISTENT cause (no python3, a corrupt record) still
+#     repeated on every invocation. It covered the transient case and left the persistent one.
+#   - The key omitted WHICH arm fired, so after "update, then reload" the follow-up "you are now
+#     serving stale text" was suppressed — in the one workflow that reliably causes it.
+#   - Subagents inherit the parent's CLAUDE_CODE_SESSION_ID and have no way to ask the user, so a
+#     subagent consumed the single ask and the user was never asked at all.
+#
+# The cascade it was meant to stop is real, and is handled where the knowledge actually lives: the
+# calling skill's step 0 tells the agent to note a repeat and carry on. The agent knows whether it
+# has already put the question this session; this script never can.
 fact "  action             = $ACTION"
 
 if [ "$JSON" = 1 ]; then
@@ -217,14 +247,14 @@ case "$ACTION" in
     say ""
     say "UNKNOWN: $MSG"
     exit 2 ;;
-  asked-already)
-    # Exit 0 so the skill proceeds, but say it out loud rather than pretending the skew is gone.
-    say "  note: $PLUGIN is still serving $LOADED against $INSTALLED — already raised this session."
-    exit 0 ;;
 esac
+# A DEGRADED RUN IS NEVER SILENT, even on the clean path. This note used to sit inside the
+# --verbose guard, which made "the catalog could not be read, so only half the check ran"
+# byte-for-byte identical to "both checks passed" — an absent check reading as a passing one, the
+# failure this whole script exists to remove, reproduced in its own success path.
+[ -n "${CATALOG:-}" ] || say "  note: catalog version unknown — only the session-vs-installed check ran"
 if [ "$VERBOSE" = 1 ]; then
   flush_facts
-  [ -n "${CATALOG:-}" ] || say "  note: catalog version unknown — only the session-vs-installed check ran"
   say "CURRENT"
 fi
 exit 0

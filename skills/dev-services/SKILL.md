@@ -20,6 +20,27 @@ never by your session. Processes you start directly die or dangle when the
 session ends; `svc`-managed ones are shared with every other session,
 worktree, and the human user.
 
+## Step 0 — is this session reading the CURRENT skill text?
+
+```bash
+bash "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-freshness.sh" "${CLAUDE_PLUGIN_ROOT}"
+```
+
+Local, no network, and **silent** unless something is wrong. Exit **3** — this session is serving
+an older cached copy of THIS plugin than the one installed; a session pins its version at the first
+call and never moves, so a mid-session `claude plugin update` never reaches it. Put it to the user
+(`AskUserQuestion`): reload (`/reload-plugins`) and re-run, or carry on knowingly. Asks once per
+plugin per session. Exit **2** — could not determine, which is not a pass. Exit **4** — this call
+is wired wrong and checked nothing; report it.
+
+Skipped automatically when this skill is not running from a plugin install (a dev symlink or a
+vendored copy), so it costs nothing in those modes.
+
+It runs BEFORE the no-svc check below, not after, and the section below is why: that fallback was
+added to this skill in a later version than some sessions are serving. A stale copy would send a
+Mac user straight into rules that forbid the only thing that works there — which is precisely the
+class of miss this step exists to catch.
+
 ## First: is svc even here?
 
 ```bash
